@@ -17,11 +17,19 @@ namespace Backends {
 	void send_reply( JobIdx job , JobMngtRpcReply&& jmrr ) {
 		Lock lock { Backend::_s_mutex }             ;
 		auto it   = Backend::_s_start_tab.find(job) ;
-		if (it==Backend::_s_start_tab.end()) return ;                     // job is dead without waiting for reply, curious but possible
-		Backend::StartEntry::Conn const& conn = it->second.conn         ;
-		ClientSockFd                     fd   ( conn.host , conn.port ) ;
-		jmrr.seq_id = conn.seq_id ;
-		OMsgBuf().send( fd , jmrr ) ;                                     // XXX : straighten out Fd : Fd must not detach on mv and Epoll must take an AutoCloseFd as arg to take close resp.
+		if (it==Backend::_s_start_tab.end()) return ;                      // job is dead without waiting for reply, curious but possible
+		Backend::StartEntry const& e = it->second ;
+		if (!e                             ) return ;                      // .
+		try {
+			jmrr.seq_id = e.conn.seq_id ;
+			ClientSockFd fd( e.conn.host , e.conn.port , 3/*n_trials*/ ) ;
+			OMsgBuf().send( fd , jmrr ) ;                                  // XXX : straighten out Fd : Fd must not detach on mv and Epoll must take an AutoCloseFd as arg to take close resp.
+		} catch (...) {                                                    // if we cannot connect to job, assume it is dead while we processed the request
+			Backend::_s_deferred_wakeup_thread->emplace_after(
+				g_config.network_delay
+			,	Backend::DeferredEntry { e.conn.seq_id , JobExec(Job(job),e.conn.host,e.start_date,New) }
+			) ;
+		}
 	}
 
 	//
@@ -159,6 +167,7 @@ namespace Backends {
 
 	void Backend::_s_wakeup_remote( JobIdx job , StartEntry::Conn const& conn , SigDate const& start_date , JobMngtProc proc ) {
 		Trace trace(BeChnl,"_s_wakeup_remote",job,conn,proc) ;
+		SWEAR(conn.seq_id,job,conn) ;
 		try {
 			ClientSockFd fd(conn.host,conn.port) ;
 			OMsgBuf().send( fd , JobMngtRpcReply(proc,conn.seq_id) ) ; // XXX : straighten out Fd : Fd must not detach on mv and Epoll must take an AutoCloseFd as arg to take close resp.
@@ -424,7 +433,7 @@ namespace Backends {
 		DF}
 		Job job { jmrr.job } ;
 		Trace trace(BeChnl,"_s_handle_job_mngt",jmrr) ;
-		{	Lock lock { _s_mutex } ;                                    // prevent sub-backend from manipulating _s_start_tab from main thread, lock for minimal time
+		{	Lock lock { _s_mutex } ;                                      // prevent sub-backend from manipulating _s_start_tab from main thread, lock for minimal time
 			//                                                                                                                                            keep_fd
 			auto        it    = _s_start_tab.find(+job) ; if (it==_s_start_tab.end()        ) { trace("not_in_tab"                              ) ; return false ; }
 			StartEntry& entry = it->second              ; if (entry.conn.seq_id!=jmrr.seq_id) { trace("bad_seq_id",entry.conn.seq_id,jmrr.seq_id) ; return false ; }
@@ -503,6 +512,7 @@ namespace Backends {
 			for( auto jit = _s_start_tab.begin() ; jit!=_s_start_tab.end() ;) { // /!\ we erase entries while iterating
 				JobIdx      j = jit->first  ;
 				StartEntry& e = jit->second ;
+				if (!e) { jit++ ; continue ; }
 				if (ri) {
 					if ( e.reqs.size()==1 && e.reqs[0]==ri ) goto Kill ;
 					for( auto it = e.reqs.begin() ; it!=e.reqs.end() ; it++ ) { // e.reqs is a non-sorted vector, we must search ri by hand
@@ -642,7 +652,7 @@ namespace Backends {
 				be->addr = ServerSockFd::s_addr(ifce) ;
 			}
 			try                       { be->config(cfg.dct,dynamic) ; be->config_err.clear() ; trace("ready",t  ) ; }
-			catch (::string const& e) { SWEAR(+e)                   ; be->config_err = e     ; trace("err"  ,t,e) ; } // empty config_err means ready
+			catch (::string const& e) { SWEAR(+e)                   ; be->config_err = e     ; trace("err"  ,t,e) ; }                                       // empty config_err means ready
 		}
 		job_start_thread.wait_started() ;
 		job_mngt_thread .wait_started() ;
